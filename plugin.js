@@ -9,7 +9,10 @@
   'use strict';
 
   var STORAGE_KEY_TARGET_LANG = 'quicktranslator_target_lang';
+  var STORAGE_KEY_SERVICE = 'quicktranslator_service';
+  var STORAGE_KEY_APIKEY_PREFIX = 'quicktranslator_apikey_';
   var DEFAULT_TARGET_LANG = 'it';
+  var DEFAULT_SERVICE = 'google';
 
   // DOM Elements cache
   var elements = {};
@@ -17,6 +20,7 @@
   var isInitialized = false;
   var lastTranslatedSource = '';
   var lastTranslatedPair = '';
+  var lastTranslatedService = '';
   var currentRequestId = 0;
   var currentAbortController = null;
   var selectionDebounceTimer = null;
@@ -90,6 +94,13 @@
 
   function getElements() {
     return {
+      serviceSelect: document.getElementById('serviceSelect'),
+      apiKeyGroup: document.getElementById('apiKeyGroup'),
+      apiKeyInput: document.getElementById('apiKeyInput'),
+      apiKeyLabel: document.getElementById('apiKeyLabel'),
+      apiKeyHint: document.getElementById('apiKeyHint'),
+      toggleApiKeyBtn: document.getElementById('toggleApiKeyBtn'),
+      fallbackNotice: document.getElementById('fallbackNotice'),
       sourceLangSelect: document.getElementById('sourceLangSelect'),
       targetLangSelect: document.getElementById('targetLangSelect'),
       swapBtn: document.getElementById('swapBtn'),
@@ -116,19 +127,102 @@
     }
     isInitialized = true;
 
-    // Load saved target language preference
+    // 1. Load saved service engine
     try {
-      var saved = localStorage.getItem(STORAGE_KEY_TARGET_LANG);
-      if (saved && elements.targetLangSelect.querySelector('option[value="' + saved + '"]')) {
-        elements.targetLangSelect.value = saved;
+      var savedService = localStorage.getItem(STORAGE_KEY_SERVICE);
+      if (savedService && ['google', 'libre', 'deepl'].indexOf(savedService) !== -1) {
+        if (elements.serviceSelect) elements.serviceSelect.value = savedService;
       }
     } catch (e) {}
+
+    // 2. Load saved API key for current service
+    updateApiKeyVisibility();
+
+    // 3. Load saved target language preference
+    try {
+      var savedLang = localStorage.getItem(STORAGE_KEY_TARGET_LANG);
+      if (savedLang && elements.targetLangSelect.querySelector('option[value="' + savedLang + '"]')) {
+        elements.targetLangSelect.value = savedLang;
+      }
+    } catch (e2) {}
 
     bindEventListeners();
     return true;
   }
 
+  function updateApiKeyVisibility() {
+    if (!elements.serviceSelect || !elements.apiKeyGroup || !elements.apiKeyInput) return;
+    var service = elements.serviceSelect.value;
+
+    // Retrieve saved key for this service
+    var savedKey = '';
+    try {
+      savedKey = localStorage.getItem(STORAGE_KEY_APIKEY_PREFIX + service) || '';
+    } catch (e) {}
+    elements.apiKeyInput.value = savedKey;
+
+    if (service === 'google') {
+      elements.apiKeyGroup.style.display = 'none';
+      elements.apiKeyInput.classList.remove('api-key-highlight');
+    } else if (service === 'libre') {
+      elements.apiKeyGroup.style.display = 'flex';
+      elements.apiKeyInput.classList.remove('api-key-highlight');
+      elements.apiKeyInput.placeholder = 'Enter custom LibreTranslate key (optional)...';
+      if (elements.apiKeyHint) {
+        elements.apiKeyHint.textContent = 'Optional for custom instances';
+        elements.apiKeyHint.className = 'field-hint';
+      }
+    } else if (service === 'deepl') {
+      elements.apiKeyGroup.style.display = 'flex';
+      elements.apiKeyInput.classList.add('api-key-highlight');
+      elements.apiKeyInput.placeholder = 'Enter DeepL Auth Key (...:fx)...';
+      if (elements.apiKeyHint) {
+        elements.apiKeyHint.textContent = 'Required for DeepL API (Free / Pro)';
+        elements.apiKeyHint.className = 'field-hint hint-required';
+      }
+    }
+  }
+
   function bindEventListeners() {
+    // Engine Service change
+    if (elements.serviceSelect) {
+      elements.serviceSelect.addEventListener('change', function () {
+        var service = elements.serviceSelect.value;
+        try {
+          localStorage.setItem(STORAGE_KEY_SERVICE, service);
+        } catch (e) {}
+        updateApiKeyVisibility();
+        hideFallbackNotice();
+        if (elements.sourceText.value.trim().length > 0) {
+          performTranslation(true);
+        }
+      });
+    }
+
+    // API Key input change & persistence
+    if (elements.apiKeyInput) {
+      elements.apiKeyInput.addEventListener('input', function () {
+        var service = elements.serviceSelect ? elements.serviceSelect.value : 'google';
+        var key = elements.apiKeyInput.value;
+        try {
+          localStorage.setItem(STORAGE_KEY_APIKEY_PREFIX + service, key);
+        } catch (e) {}
+      });
+    }
+
+    // Toggle API Key visibility
+    if (elements.toggleApiKeyBtn && elements.apiKeyInput) {
+      elements.toggleApiKeyBtn.addEventListener('click', function () {
+        if (elements.apiKeyInput.type === 'password') {
+          elements.apiKeyInput.type = 'text';
+          elements.toggleApiKeyBtn.textContent = '🔒';
+        } else {
+          elements.apiKeyInput.type = 'password';
+          elements.toggleApiKeyBtn.textContent = '👁';
+        }
+      });
+    }
+
     // Target Language changed
     elements.targetLangSelect.addEventListener('change', function () {
       try {
@@ -206,8 +300,10 @@
       elements.targetText.value = '';
       lastTranslatedSource = '';
       lastTranslatedPair = '';
+      lastTranslatedService = '';
       updateCharCount();
       hideError();
+      hideFallbackNotice();
       setStatus('ready', 'Ready');
     });
 
@@ -255,6 +351,17 @@
     elements.errorAlert.style.display = 'none';
   }
 
+  function showFallbackNotice(msg) {
+    if (!elements.fallbackNotice) return;
+    elements.fallbackNotice.textContent = msg;
+    elements.fallbackNotice.style.display = 'block';
+  }
+
+  function hideFallbackNotice() {
+    if (!elements.fallbackNotice) return;
+    elements.fallbackNotice.style.display = 'none';
+  }
+
   // Core Translation Method with Sequential Request ID & Abort Support
   function performTranslation(force) {
     if (!elements.sourceText) return;
@@ -263,15 +370,19 @@
       elements.targetText.value = '';
       lastTranslatedSource = '';
       lastTranslatedPair = '';
+      lastTranslatedService = '';
+      hideFallbackNotice();
       return;
     }
 
     var sourceLang = elements.sourceLangSelect.value;
     var targetLang = elements.targetLangSelect.value;
+    var service = elements.serviceSelect ? elements.serviceSelect.value : 'google';
+    var apiKey = elements.apiKeyInput ? elements.apiKeyInput.value.trim() : '';
     var langPair = sourceLang + '->' + targetLang;
 
     // Prevent redundant requests if already translated
-    if (!force && text === lastTranslatedSource && langPair === lastTranslatedPair && elements.targetText.value.trim().length > 0) {
+    if (!force && text === lastTranslatedSource && langPair === lastTranslatedPair && service === lastTranslatedService && elements.targetText.value.trim().length > 0) {
       return;
     }
 
@@ -279,6 +390,8 @@
       elements.targetText.value = text;
       lastTranslatedSource = text;
       lastTranslatedPair = langPair;
+      lastTranslatedService = service;
+      hideFallbackNotice();
       setStatus('ready', 'Identical');
       return;
     }
@@ -300,23 +413,27 @@
     if (elements.translateBtnText) elements.translateBtnText.textContent = 'Translating...';
     setStatus('busy', 'Translating');
     hideError();
+    hideFallbackNotice();
 
     var currentReqText = text;
     var currentReqPair = langPair;
+    var currentReqService = service;
 
-    translateRequest(text, sourceLang, targetLang, currentAbortController ? currentAbortController.signal : null)
+    translateRequest(text, sourceLang, targetLang, service, apiKey, currentAbortController ? currentAbortController.signal : null)
       .then(function (result) {
-        if (myReqId !== currentRequestId) return; // Discard superseded result
+        if (myReqId !== currentRequestId) return;
         elements.targetText.value = result;
         lastTranslatedSource = currentReqText;
         lastTranslatedPair = currentReqPair;
+        lastTranslatedService = currentReqService;
+        hideFallbackNotice();
         setStatus('ready', 'Translated');
       })
       .catch(function (err) {
-        if (err && err.name === 'AbortError') return; // Deliberately superseded
+        if (err && err.name === 'AbortError') return;
         if (myReqId === currentRequestId) {
           console.error('QuickTranslator error:', err);
-          showError('Translation failed. Please check network connection.');
+          showError(err && err.message ? err.message : 'Translation failed. Please check network connection.');
         }
       })
       .finally(function () {
@@ -324,7 +441,7 @@
           isTranslating = false;
           elements.translateBtn.disabled = false;
           if (elements.btnSpinner) elements.btnSpinner.style.display = 'none';
-          if (elements.translateBtnText) elements.translateBtnText.textContent = 'Traduci (Translate)';
+          if (elements.translateBtnText) elements.translateBtnText.textContent = 'Translate';
 
           // If text changed in the textarea while the request was in flight, translate newest content
           var latestText = cleanAndNormalizeText(elements.sourceText.value);
@@ -335,16 +452,36 @@
       });
   }
 
-  // Multi-Engine Translation Service (Google Translate primary + MyMemory fallback)
-  function translateRequest(text, sourceLang, targetLang, signal) {
-    var src = sourceLang === 'auto' ? 'auto' : sourceLang;
-    var tgt = targetLang;
+  // 5-Second Fetch Wrapper with AbortController
+  function fetchWithTimeout(url, options, timeoutMs, externalSignal) {
+    timeoutMs = timeoutMs || 5000;
+    var controller = new AbortController();
+    var timer = setTimeout(function () {
+      controller.abort();
+    }, timeoutMs);
 
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        clearTimeout(timer);
+        controller.abort();
+      } else {
+        externalSignal.addEventListener('abort', function () {
+          clearTimeout(timer);
+          controller.abort();
+        });
+      }
+    }
+
+    var opts = Object.assign({}, options, { signal: controller.signal });
+    return fetch(url, opts).finally(function () {
+      clearTimeout(timer);
+    });
+  }
+
+  // Engine: Google Translate
+  function callGoogleTranslate(text, src, tgt, signal, timeoutMs) {
     var googleUrl = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=' + encodeURIComponent(src) + '&tl=' + encodeURIComponent(tgt) + '&dt=t&q=' + encodeURIComponent(text);
-
-    var fetchOptions = signal ? { signal: signal } : {};
-
-    return fetch(googleUrl, fetchOptions)
+    return fetchWithTimeout(googleUrl, { method: 'GET' }, timeoutMs, signal)
       .then(function (res) {
         if (!res.ok) throw new Error('Google Translate HTTP ' + res.status);
         return res.json();
@@ -359,16 +496,130 @@
             return translatedParts;
           }
         }
-        throw new Error('Empty translation output');
+        throw new Error('Empty Google translation output');
       })
       .catch(function (err) {
-        if (err && err.name === 'AbortError') throw err;
+        if (signal && signal.aborted) throw err;
+        var altGoogleUrl = 'https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=' + encodeURIComponent(src) + '&tl=' + encodeURIComponent(tgt) + '&q=' + encodeURIComponent(text);
+        return fetchWithTimeout(altGoogleUrl, { method: 'GET' }, timeoutMs, signal)
+          .then(function (res) {
+            if (!res.ok) throw new Error('Google Translate alt HTTP ' + res.status);
+            return res.json();
+          })
+          .then(function (data) {
+            if (Array.isArray(data) && typeof data[0] === 'string' && data[0].trim().length > 0) {
+              return data[0];
+            } else if (typeof data === 'string' && data.trim().length > 0) {
+              return data;
+            }
+            throw new Error('Empty Google alt output');
+          });
+      });
+  }
 
-        // Fallback: MyMemory API
+  // Engine: LibreTranslate
+  function callLibreTranslate(text, src, tgt, apiKey, signal, timeoutMs) {
+    var payload = {
+      q: text,
+      source: src,
+      target: tgt,
+      format: 'text'
+    };
+    if (apiKey && apiKey.length > 0) {
+      payload.api_key = apiKey;
+    }
+
+    var endpoint = 'https://translate.argosopentech.com/translate';
+    return fetchWithTimeout(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }, timeoutMs, signal)
+      .then(function (res) {
+        if (!res.ok) throw new Error('LibreTranslate HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        if (data && data.translatedText) {
+          return decodeHTMLEntities(data.translatedText);
+        }
+        throw new Error('Empty LibreTranslate output');
+      });
+  }
+
+  // Engine: DeepL
+  function callDeepLTranslate(text, src, tgt, apiKey, signal, timeoutMs) {
+    if (!apiKey || apiKey.length === 0) {
+      throw new Error('DeepL API Key is required. Please enter your API key in the field above.');
+    }
+    var isFree = apiKey.indexOf(':fx') !== -1;
+    var endpoint = isFree ? 'https://api-free.deepl.com/v2/translate' : 'https://api.deepl.com/v2/translate';
+
+    var params = new URLSearchParams();
+    params.append('text', text);
+    params.append('target_lang', tgt.toUpperCase());
+    if (src !== 'auto') {
+      params.append('source_lang', src.toUpperCase());
+    }
+
+    return fetchWithTimeout(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'DeepL-Auth-Key ' + apiKey,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: params.toString()
+    }, timeoutMs, signal)
+      .then(function (res) {
+        if (!res.ok) throw new Error('DeepL API HTTP ' + res.status);
+        return res.json();
+      })
+      .then(function (data) {
+        if (data && Array.isArray(data.translations) && data.translations.length > 0) {
+          return data.translations[0].text;
+        }
+        throw new Error('Empty DeepL output');
+      });
+  }
+
+  // Multi-Engine Translation Service with 5-Second Strict Timeout & Fallback
+  function translateRequest(text, sourceLang, targetLang, service, apiKey, signal) {
+    var src = sourceLang === 'auto' ? 'auto' : sourceLang;
+    var tgt = targetLang;
+    var primaryPromise;
+
+    if (service === 'deepl') {
+      primaryPromise = callDeepLTranslate(text, src, tgt, apiKey, signal, 5000);
+    } else if (service === 'libre') {
+      primaryPromise = callLibreTranslate(text, src, tgt, apiKey, signal, 5000);
+    } else {
+      primaryPromise = callGoogleTranslate(text, src, tgt, signal, 5000);
+    }
+
+    return primaryPromise.catch(function (primaryErr) {
+      if (signal && signal.aborted) throw primaryErr;
+
+      // 5-Second Fallback: Switch to secondary engine
+      var fallbackNoticeText = service === 'google'
+        ? 'Google Translate not responding (5s timeout), switching to LibreTranslate...'
+        : service === 'deepl'
+        ? 'DeepL request failed/timeout, switching to Google Translate...'
+        : 'LibreTranslate not responding, switching to Google Translate...';
+
+      showFallbackNotice(fallbackNoticeText);
+
+      var fallbackPromise = (service === 'google')
+        ? callLibreTranslate(text, src, tgt, undefined, signal, 5000)
+        : callGoogleTranslate(text, src, tgt, signal, 5000);
+
+      return fallbackPromise.catch(function (fallbackErr) {
+        if (signal && signal.aborted) throw fallbackErr;
+
+        // Tertiary fallback: MyMemory API
         var langPair = (src === 'auto' ? 'autodetect' : src) + '|' + tgt;
         var myMemoryUrl = 'https://api.mymemory.translated.net/get?q=' + encodeURIComponent(text) + '&langpair=' + encodeURIComponent(langPair);
 
-        return fetch(myMemoryUrl, fetchOptions)
+        return fetchWithTimeout(myMemoryUrl, { method: 'GET' }, 5000, signal)
           .then(function (res) {
             if (!res.ok) throw new Error('MyMemory HTTP ' + res.status);
             return res.json();
@@ -378,9 +629,10 @@
               var decoded = decodeHTMLEntities(data.responseData.translatedText);
               if (decoded) return decoded;
             }
-            throw new Error('MyMemory fallback failed');
+            throw new Error('All translation engines failed');
           });
       });
+    });
   }
 
   function decodeHTMLEntities(text) {
@@ -530,6 +782,37 @@
    */
   window.Asc.plugin.event_onTargetPositionChanged = onPositionChanged;
   window.Asc.plugin.onTargetPositionChanged = onPositionChanged;
+
+  /**
+   * Theme changed event handler (ONLYOFFICE marketplace requirement)
+   * Dynamically toggles dark/light theme classes on body.
+   */
+  window.Asc.plugin.onThemeChanged = function (theme) {
+    if (window.Asc.plugin.onThemeChangedBase) {
+      try {
+        window.Asc.plugin.onThemeChangedBase(theme);
+      } catch (e) {}
+    }
+    var isDark = false;
+    if (theme) {
+      if (theme.type && (theme.type === 'dark' || theme.type === 'contrast-dark')) {
+        isDark = true;
+      } else if (theme.name && theme.name.toLowerCase().indexOf('dark') !== -1) {
+        isDark = true;
+      } else if (typeof theme === 'string' && theme.toLowerCase().indexOf('dark') !== -1) {
+        isDark = true;
+      }
+    }
+    if (document.body) {
+      if (isDark) {
+        document.body.classList.add('theme-dark');
+        document.body.classList.remove('theme-light');
+      } else {
+        document.body.classList.remove('theme-dark');
+        document.body.classList.add('theme-light');
+      }
+    }
+  };
 
   /**
    * Modal / Panel button handler
